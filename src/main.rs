@@ -5,6 +5,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, Event, KeyEventKind},
     execute,
@@ -20,45 +21,62 @@ use space::ui;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
+#[derive(Parser)]
+#[command(
+    name = "space",
+    version,
+    about = "spaces of repos + agent conversations, in one TUI",
+    after_help = "layout:\n  ~/Desktop/repos/<group>/<repo>  canonical pool (you populate)\n  ~/Desktop/<space>/              symlinks + <repo>-<branch> worktrees\n\nshell integration: add  eval \"$(space --init zsh)\"  to ~/.zshrc"
+)]
+struct Cli {
+    /// Print the shell wrapper for SHELL (supported: zsh)
+    #[arg(long, value_name = "SHELL")]
+    init: Option<String>,
+
+    /// Internal: handoff path written for the shell wrapper
+    #[arg(long, global = true, hide = true, value_name = "PATH")]
+    handoff_file: Option<PathBuf>,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+/// Agent-facing subcommands, documented in each space's CLAUDE.md/AGENTS.md.
+/// All work from anywhere inside a space.
+#[derive(Subcommand)]
+enum Cmd {
+    /// Add a <repo>-<branch> worktree (run before branching)
+    Wt { repo: String, branch: String },
+    /// Update repos from origin (ff-only on main, fetch-only on branches)
+    Pull { repo: Option<String> },
+    /// Link a pool repo into this space (bare name or <group>/<repo>)
+    Add { repo: String },
+    /// List members and the pool
+    Ls,
+    /// Branch/PR stack of a repo
+    Stack { repo: Option<String> },
+}
+
 fn main() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Cli::parse();
 
-    // The zsh wrapper passes --handoff-file on EVERY invocation; strip it
-    // before dispatch so subcommands pass through untouched. Only the TUI
-    // consumes it.
-    let mut handoff: Option<PathBuf> = None;
-    if let Some(i) = args.iter().position(|a| a == "--handoff-file") {
-        if i + 1 >= args.len() {
-            bail!("--handoff-file requires a path");
-        }
-        handoff = Some(PathBuf::from(args.remove(i + 1)));
-        args.remove(i);
-    }
-
-    match args.first().map(String::as_str) {
-        Some("-h") | Some("--help") => {
-            print_help();
-            Ok(())
-        }
-        // Prints the shell wrapper; `eval "$(space --init zsh)"` in ~/.zshrc.
-        Some("--init") => match args.get(1).map(String::as_str) {
-            Some("zsh") => {
+    if let Some(shell) = cli.init.as_deref() {
+        return match shell {
+            "zsh" => {
                 print!("{}", include_str!("../shell/space.zsh"));
                 Ok(())
             }
-            other => bail!(
-                "unsupported shell {:?}; supported: zsh",
-                other.unwrap_or("<none>")
-            ),
-        },
-        // Agent-facing subcommands, documented in each space's CLAUDE.md/AGENTS.md.
-        // All work from anywhere inside a space.
-        Some("wt") => cmd_wt(&args[1..]),
-        Some("pull") => cmd_pull(&args[1..]),
-        Some("add") => cmd_add(&args[1..]),
-        Some("ls") => cmd_ls(),
-        Some("stack") => cmd_stack(&args[1..]),
-        _ => run_tui(handoff),
+            other => bail!("unsupported shell {other:?}; supported: zsh"),
+        };
+    }
+
+    match cli.cmd {
+        Some(Cmd::Wt { repo, branch }) => cmd_wt(&repo, &branch),
+        Some(Cmd::Pull { repo }) => cmd_pull(repo.as_deref()),
+        Some(Cmd::Add { repo }) => cmd_add(&repo),
+        Some(Cmd::Ls) => cmd_ls(),
+        Some(Cmd::Stack { repo }) => cmd_stack(repo.as_deref()),
+        None => run_tui(cli.handoff_file),
     }
 }
 
@@ -79,10 +97,7 @@ fn current_space() -> Result<PathBuf> {
     })
 }
 
-fn cmd_wt(args: &[String]) -> Result<()> {
-    let [repo, branch] = args else {
-        bail!("usage: space wt <repo> <branch>");
-    };
+fn cmd_wt(repo: &str, branch: &str) -> Result<()> {
     let space_dir = current_space()?;
     let name = spaces::promote_to_worktree(&space_dir, repo, branch)?;
     let _ = spaces::refresh_policy_files(&space_dir);
@@ -93,9 +108,8 @@ fn cmd_wt(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pull(args: &[String]) -> Result<()> {
+fn cmd_pull(only: Option<&str>) -> Result<()> {
     let space_dir = current_space()?;
-    let only = args.first().map(String::as_str);
     let members = spaces::members(&space_dir);
     if let Some(name) = only
         && !members.iter().any(|r| r.name == name)
@@ -131,10 +145,7 @@ fn cmd_pull(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(args: &[String]) -> Result<()> {
-    let [repo] = args else {
-        bail!("usage: space add <repo>   (bare name or group-qualified, e.g. acme/api)");
-    };
+fn cmd_add(repo: &str) -> Result<()> {
     let space_dir = current_space()?;
     let resolved = spaces::resolve_pool_repo(&space_dir, repo)?;
     spaces::add_repo(&space_dir, &resolved)?;
@@ -162,9 +173,9 @@ fn cmd_ls() -> Result<()> {
     Ok(())
 }
 
-fn cmd_stack(args: &[String]) -> Result<()> {
+fn cmd_stack(repo: Option<&str>) -> Result<()> {
     let space_dir = current_space()?;
-    let dir = match args.first() {
+    let dir = match repo {
         Some(repo) => {
             let d = space_dir.join(repo);
             if !d.is_dir() {
@@ -437,34 +448,4 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-fn print_help() {
-    println!(
-        "space: spaces of repos + agent conversations, in one TUI
-
-USAGE:
-    space              open the TUI
-    space --init zsh   print the shell wrapper (add eval \"$(space --init zsh)\" to ~/.zshrc)
-    space pull [repo]  inside a space: update repos from origin (ff-only on main)
-    space add <repo>   inside a space: link a pool repo in (bare or us/<repo>)
-    space ls           inside a space: list members and the pool
-    space wt <repo> <branch>
-                       inside a space: swap a symlinked repo for a git worktree
-                       on <branch> (what agents run before branching)
-
-LAYOUT:
-    ~/Desktop/repos/<repo>   canonical checkouts (you populate; source of truth)
-    ~/Desktop/<space>/       a space: symlinks/worktrees into the pool
-
-KEYS (spaces view):
-    j/k move   l/h panes   n new space   a add repo   w worktree   u unbranch
-    x remove   Enter launch claude   o launch codex   D delete space   Tab conversations
-
-KEYS (conversations view):
-    j/k move   / search   Enter resume   f fork   ^u/^d scroll preview   Tab spaces
-
-READ-ONLY:
-    ~/.claude/projects/**    ~/.codex/sessions/**   (transcripts are never written)"
-    );
 }
