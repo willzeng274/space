@@ -913,7 +913,7 @@ impl App {
             return;
         };
         if self.pool.is_empty() {
-            self.status = Some("no repos in ~/Desktop/repos to add".into());
+            self.status = Some(format!("no repos in {} to add", space::pool_display()));
             return;
         }
         let present: Vec<&str> = space.repos.iter().map(|r| r.name.as_str()).collect();

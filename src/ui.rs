@@ -134,7 +134,10 @@ fn draw_repo_list(f: &mut Frame, app: &mut App, area: Rect) {
                     "a",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" to add a repo from ~/Desktop/repos"),
+                Span::raw(format!(
+                    " to add a repo from {}",
+                    crate::space::pool_display()
+                )),
             ]),
         ]))
         .block(block);
@@ -147,7 +150,7 @@ fn draw_repo_list(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|r| {
             let (state_txt, color) = match &r.state {
-                RepoState::Symlink => ("-> repos/".to_string(), Color::DarkGray),
+                RepoState::Symlink => (format!("-> {}/", crate::space::POOL_DIR), Color::DarkGray),
                 RepoState::Worktree { branch } => (format!(" {branch}"), Color::Green),
                 RepoState::Foreign => ("(unmanaged)".to_string(), Color::Red),
             };
@@ -279,8 +282,14 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
         Modal::None => {}
         Modal::Input { kind, buffer } => {
             let (title, hint) = match kind {
-                InputKind::NewSpace => (" new space ", "folder name under ~/Desktop"),
-                InputKind::Branch => (" new branch ", "branch for the worktree"),
+                InputKind::NewSpace => (
+                    " new space ".to_string(),
+                    format!("folder name under {}", crate::space::root_display()),
+                ),
+                InputKind::Branch => (
+                    " new branch ".to_string(),
+                    "branch for the worktree".to_string(),
+                ),
             };
             let area = centered(50, 5, f.area());
             f.render_widget(Clear, area);
@@ -318,7 +327,10 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
-                .title(" add repo (from ~/Desktop/repos) ")
+                .title(format!(
+                    " add repo (from {}) ",
+                    crate::space::pool_display()
+                ))
                 .padding(Padding::horizontal(1));
             let inner = block.inner(area);
             f.render_widget(block, area);

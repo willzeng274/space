@@ -45,14 +45,21 @@ impl Session {
     }
 }
 
-/// The space a working directory belongs to: the component right under `Desktop`
-/// if present, otherwise the directory's own name.
+/// The space a working directory belongs to: the path component right after
+/// the compile-time root (default `Desktop`), otherwise the directory's own
+/// name. The root may span several components (e.g. `code/spaces`).
 pub fn space_of(cwd: &str) -> String {
     let parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-    if let Some(i) = parts.iter().position(|p| *p == "Desktop")
-        && let Some(space) = parts.get(i + 1)
-    {
-        return (*space).to_string();
+    let root: Vec<&str> = crate::space::ROOT_DIR
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !root.is_empty() && parts.len() > root.len() {
+        for i in 0..=parts.len() - root.len() - 1 {
+            if parts[i..i + root.len()] == root[..] {
+                return parts[i + root.len()].to_string();
+            }
+        }
     }
     parts
         .last()
@@ -174,10 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn space_from_desktop_layout() {
-        assert_eq!(space_of("/Users/u/Desktop/proj/web"), "proj");
-        assert_eq!(space_of("/Users/u/Desktop/tools/space"), "tools");
-        assert_eq!(space_of("/Users/u/Desktop/loose-repo"), "loose-repo");
+    fn space_from_root_layout() {
+        let root = crate::space::ROOT_DIR;
+        assert_eq!(space_of(&format!("/Users/u/{root}/proj/web")), "proj");
+        assert_eq!(space_of(&format!("/Users/u/{root}/tools/space")), "tools");
+        assert_eq!(
+            space_of(&format!("/Users/u/{root}/loose-repo")),
+            "loose-repo"
+        );
         assert_eq!(space_of("/tmp/whatever/proj"), "proj");
     }
 }

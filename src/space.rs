@@ -1,10 +1,11 @@
-//! Space management: the canonical repo pool, spaces (folders under `~/Desktop`),
-//! and the symlink / git-worktree operations that compose them.
+//! Space management: the canonical repo pool, spaces (folders under the
+//! compile-time ROOT_DIR, default `~/Desktop`), and the symlink / git-worktree
+//! operations that compose them.
 //!
 //! Model:
-//! - `~/Desktop/repos/<repo>` — canonical checkouts, the source of truth. We never
+//! - `<root>/<pool>/<repo>`: canonical checkouts, the source of truth. We never
 //!   clone here; the user populates it.
-//! - `~/Desktop/<space>/` — a *space*, marked by a `.space.toml` file. Its members
+//! - `<root>/<space>/`: a *space*, marked by a `.space.toml` file. Its members
 //!   are symlinks into the pool (default) or git worktrees (once a branch is made).
 //!   Membership is derived from the filesystem, so config never drifts from reality.
 
@@ -14,7 +15,29 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 
 pub const MARKER: &str = ".space.toml";
-pub const POOL_DIR: &str = "repos";
+
+/// Layout, fixed at compile time. Override when building:
+///   SPACE_ROOT=workspaces SPACE_POOL=checkouts cargo build --release
+/// ROOT_DIR is relative to $HOME and may contain slashes; POOL_DIR is the
+/// pool folder name directly under it.
+pub const ROOT_DIR: &str = match option_env!("SPACE_ROOT") {
+    Some(v) => v,
+    None => "Desktop",
+};
+pub const POOL_DIR: &str = match option_env!("SPACE_POOL") {
+    Some(v) => v,
+    None => "repos",
+};
+
+/// `~/<ROOT_DIR>` for user-facing messages.
+pub fn root_display() -> String {
+    format!("~/{ROOT_DIR}")
+}
+
+/// `~/<ROOT_DIR>/<POOL_DIR>` for user-facing messages.
+pub fn pool_display() -> String {
+    format!("~/{ROOT_DIR}/{POOL_DIR}")
+}
 
 /// A canonical repo available in the pool.
 #[derive(Clone, Debug)]
@@ -47,7 +70,7 @@ pub struct Space {
 }
 
 pub fn desktop_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join("Desktop"))
+    dirs::home_dir().map(|h| h.join(ROOT_DIR))
 }
 
 pub fn pool_dir() -> Option<PathBuf> {
@@ -102,7 +125,7 @@ fn collect_pool(dir: &Path, prefix: &str, out: &mut Vec<PoolRepo>) {
     }
 }
 
-/// All spaces: folders directly under `~/Desktop` carrying the marker file
+/// All spaces: folders directly under the root carrying the marker file
 /// (the `repos` pool is excluded even if it somehow has one).
 pub fn list_spaces() -> Vec<Space> {
     let Some(desktop) = desktop_dir() else {
@@ -247,10 +270,10 @@ pub fn create_space(name: &str) -> Result<PathBuf> {
     if name.contains('/') || name.starts_with('.') {
         bail!("invalid space name");
     }
-    let desktop = desktop_dir().ok_or_else(|| anyhow!("cannot locate ~/Desktop"))?;
+    let desktop = desktop_dir().ok_or_else(|| anyhow!("cannot locate {}", root_display()))?;
     let path = desktop.join(name);
     if path.exists() {
-        bail!("~/Desktop/{name} already exists");
+        bail!("{}/{name} already exists", root_display());
     }
     std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
     write_space_files(&path, name)?;
@@ -392,7 +415,7 @@ pub fn add_repo(space: &Path, repo: &str) -> Result<()> {
     let pool = pool_for(space).ok_or_else(|| anyhow!("cannot locate the repo pool"))?;
     let src = pool.join(repo);
     if !src.is_dir() {
-        bail!("no repo `{repo}` in ~/Desktop/repos");
+        bail!("no repo `{repo}` in {}", pool_display());
     }
     let base = Path::new(repo)
         .file_name()
@@ -695,17 +718,18 @@ fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 pub fn policy_markdown(name: &str) -> String {
+    let pool = pool_display();
     format!(
         "# Space: {name}
 
 This folder is a **space** managed by the `space` tool: a working set of repositories.
-Each subdirectory here is a **symlink** to a canonical checkout in `~/Desktop/repos/`
-(possibly grouped, e.g. `~/Desktop/repos/us/<repo>`), or a git worktree of one once a
+Each subdirectory here is a **symlink** to a canonical checkout in `{pool}/`
+(possibly grouped, e.g. `{pool}/<group>/<repo>`), or a git worktree of one once a
 branch has been made.
 
 ## Rules for agents
 
-- The source of truth for every repo is its checkout under `~/Desktop/repos/`. Edits made
+- The source of truth for every repo is its checkout under `{pool}/`. Edits made
   through the symlinks in this space modify those canonical checkouts directly, and other
   spaces may reference the same checkout.
 - **Repo-specific documentation goes inside that repo's own directory** so it can be
@@ -737,7 +761,7 @@ space wt <repo> <branch> # REQUIRED before branching: adds a <repo>-<branch> wor
   when the repo is on main/master with a clean tree. On a feature-branch worktree it only
   fetches and reports, never merges. It refuses (with the reason) on dirty or diverged
   repos instead of guessing.
-- `space add` resolves a bare repo name against the pool (`~/Desktop/repos/**`) and errors
+- `space add` resolves a bare repo name against the pool (`{pool}/**`) and errors
   if the name is ambiguous or unknown; it links the repo into this space as a symlink.
 - `space wt` creates the branch in an isolated worktree named `<repo>-<branch>` (the repo's
   symlink stays as the canonical view) and carries untracked files plus gitignored `*.md`
@@ -764,11 +788,11 @@ mod tests {
             let root = std::env::temp_dir()
                 .join(format!("space-space-tests-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("repos")).unwrap();
+            std::fs::create_dir_all(root.join(POOL_DIR)).unwrap();
             Sandbox { root }
         }
         fn pool(&self) -> PathBuf {
-            self.root.join("repos")
+            self.root.join(POOL_DIR)
         }
         /// A minimal committed git repo with one gitignored note.
         fn make_repo(&self, name: &str) -> PathBuf {
@@ -1074,7 +1098,7 @@ mod tests {
         assert!(md.contains("space pull"));
         assert!(md.contains("space add <repo>"));
         assert!(md.contains("space ls"));
-        assert!(md.contains("~/Desktop/repos"));
+        assert!(md.contains(&pool_display()));
     }
 
     #[test]

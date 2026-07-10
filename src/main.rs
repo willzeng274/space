@@ -26,7 +26,7 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
     name = "space",
     version,
     about = "spaces of repos + agent conversations, in one TUI",
-    after_help = "layout:\n  ~/Desktop/repos/<group>/<repo>  canonical pool (you populate)\n  ~/Desktop/<space>/              symlinks + <repo>-<branch> worktrees\n\nshell integration: add  eval \"$(space --init zsh)\"  to ~/.zshrc"
+    after_help = layout_help()
 )]
 struct Cli {
     /// Print the shell wrapper for SHELL (supported: zsh)
@@ -55,6 +55,16 @@ enum Cmd {
     Ls,
     /// Branch/PR stack of a repo
     Stack { repo: Option<String> },
+}
+
+/// Built from the compile-time layout constants so a custom build's help
+/// matches its actual paths.
+fn layout_help() -> String {
+    format!(
+        "layout:\n  {pool}/<group>/<repo>  canonical pool (you populate)\n  {root}/<space>/        symlinks + <repo>-<branch> worktrees\n\nshell integration: add  eval \"$(space --init zsh)\"  to ~/.zshrc",
+        pool = spaces::pool_display(),
+        root = spaces::root_display(),
+    )
 }
 
 fn main() -> Result<()> {
@@ -160,7 +170,7 @@ fn cmd_ls() -> Result<()> {
     println!("space: {}", space_dir.display());
     for r in spaces::members(&space_dir) {
         let state = match &r.state {
-            spaces::RepoState::Symlink => "-> repos/".to_string(),
+            spaces::RepoState::Symlink => format!("-> {}/", spaces::POOL_DIR),
             spaces::RepoState::Worktree { branch } => format!("worktree on {branch}"),
             spaces::RepoState::Foreign => "(unmanaged)".to_string(),
         };

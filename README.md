@@ -31,6 +31,16 @@ mkdir -p ~/Desktop/repos
 Needs Rust and git. Optional: `claude`, `codex`, `gh` (PR info), `delta`
 (diff paging). Missing tools degrade gracefully.
 
+The layout is fixed at compile time and defaults to `~/Desktop` with a
+`repos` pool. Override when building:
+
+```sh
+SPACE_ROOT=work SPACE_POOL=checkouts cargo build --release
+```
+
+`SPACE_ROOT` is relative to `$HOME` and may contain slashes. Everything
+follows it: paths, messages, help text, generated policy files.
+
 macOS: always `rm` before `cp` when replacing the binary. Overwriting in
 place reuses the inode and the signature cache kills it (`Killed: 9`).
 

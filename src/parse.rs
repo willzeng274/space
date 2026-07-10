@@ -381,19 +381,22 @@ mod tests {
 
     #[test]
     fn claude_parse_basic() {
-        let body = r#"
-{"type":"mode","mode":"x","sessionId":"abc"}
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the login bug"}]},"cwd":"/Users/me/Desktop/proj/app","timestamp":"2026-06-30T19:20:35.301Z"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"on it"}]},"timestamp":"2026-06-30T19:21:00.000Z"}
-{"type":"ai-title","aiTitle":"Fix login bug","sessionId":"abc"}
+        let root = crate::space::ROOT_DIR;
+        let body = format!(
+            r#"
+{{"type":"mode","mode":"x","sessionId":"abc"}}
+{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"fix the login bug"}}]}},"cwd":"/Users/me/{root}/proj/app","timestamp":"2026-06-30T19:20:35.301Z"}}
+{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"on it"}}]}},"timestamp":"2026-06-30T19:21:00.000Z"}}
+{{"type":"ai-title","aiTitle":"Fix login bug","sessionId":"abc"}}
 not even json
-"#;
-        let p = write_tmp("11111111-2222-3333-4444-555555555555.jsonl", body);
+"#
+        );
+        let p = write_tmp("11111111-2222-3333-4444-555555555555.jsonl", &body);
         let s = parse_claude_file(&p).unwrap();
         assert_eq!(s.backend, Backend::Claude);
         assert_eq!(s.id, "11111111-2222-3333-4444-555555555555");
         assert_eq!(s.title, "Fix login bug"); // ai-title wins over first prose
-        assert_eq!(s.cwd, "/Users/me/Desktop/proj/app");
+        assert_eq!(s.cwd, format!("/Users/me/{root}/proj/app"));
         assert_eq!(s.space, "proj");
         assert_eq!(s.msg_count, 2);
         assert_eq!(
@@ -415,31 +418,37 @@ not even json
 
     #[test]
     fn codex_parse_env_context_and_response_items() {
-        let body = r#"
-{"timestamp":"2026-05-01T10:00:00Z","type":"session_meta","payload":{"id":"dead-beef","cwd":"/Users/me/Desktop/toolbox/proj"}}
-{"timestamp":"2026-05-01T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"refactor the parser"}]}}
-{"timestamp":"2026-05-01T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
-"#;
-        let p = write_tmp("rollout-2026-05-01-dead-beef.jsonl", body);
+        let root = crate::space::ROOT_DIR;
+        let body = format!(
+            r#"
+{{"timestamp":"2026-05-01T10:00:00Z","type":"session_meta","payload":{{"id":"dead-beef","cwd":"/Users/me/{root}/tools/proj"}}}}
+{{"timestamp":"2026-05-01T10:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"refactor the parser"}}]}}}}
+{{"timestamp":"2026-05-01T10:00:05Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"done"}}]}}}}
+"#
+        );
+        let p = write_tmp("rollout-2026-05-01-dead-beef.jsonl", &body);
         let s = parse_codex_file(&p).unwrap();
         assert_eq!(s.backend, Backend::Codex);
         assert_eq!(s.id, "dead-beef");
-        assert_eq!(s.cwd, "/Users/me/Desktop/toolbox/proj");
-        assert_eq!(s.space, "toolbox");
+        assert_eq!(s.cwd, format!("/Users/me/{root}/tools/proj"));
+        assert_eq!(s.space, "tools");
         assert_eq!(s.title, "refactor the parser");
         assert_eq!(s.msg_count, 2);
     }
 
     #[test]
     fn codex_cwd_from_environment_context_tag() {
-        let body = r#"
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/Users/me/Desktop/space/repo</cwd>\n</environment_context>"}]}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello there"}]}}
-"#;
-        let p = write_tmp("rollout-2026-05-02-cafef00d.jsonl", body);
+        let root = crate::space::ROOT_DIR;
+        let body = format!(
+            r#"
+{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<environment_context>\n<cwd>/Users/me/{root}/sp/repo</cwd>\n</environment_context>"}}]}}}}
+{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hello there"}}]}}}}
+"#
+        );
+        let p = write_tmp("rollout-2026-05-02-cafef00d.jsonl", &body);
         let s = parse_codex_file(&p).unwrap();
-        assert_eq!(s.cwd, "/Users/me/Desktop/space/repo");
-        assert_eq!(s.space, "space");
+        assert_eq!(s.cwd, format!("/Users/me/{root}/sp/repo"));
+        assert_eq!(s.space, "sp");
         assert_eq!(s.title, "hello there");
     }
 
