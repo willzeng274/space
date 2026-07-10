@@ -1,0 +1,23 @@
+[package]
+name = "space"
+version = "0.1.0"
+edition = "2024"
+description = "Browse, search, and resume your Claude Code and Codex conversations from a keyboard-first TUI."
+
+[[bin]]
+name = "space"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+walkdir = "2.5.0"
+
+
+[profile.release]
+opt-level = 3
+lto = true
