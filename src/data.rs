@@ -27,6 +27,8 @@ pub struct Session {
     /// Id passed to `claude --resume` / `codex resume` (filename stem or in-file id).
     pub id: String,
     pub title: String,
+    /// A user-assigned name (as opposed to a generated first-message title).
+    pub custom_name: Option<String>,
     pub cwd: String,
     /// The "space": the folder the cwd lives under (e.g. `proj`, `toolbox`).
     pub space: String,
@@ -42,6 +44,40 @@ impl Session {
     // A `bool` return keeps the door open for swapping in `nucleo` fuzzy ranking later.
     pub fn matches(&self, needle_lower: &str) -> bool {
         needle_lower.is_empty() || self.search_blob.contains(needle_lower)
+    }
+
+    pub fn set_title(&mut self, title: String, custom_name: Option<String>) {
+        self.title = title;
+        self.custom_name = custom_name;
+        self.rebuild_search_blob();
+    }
+
+    pub fn apply_catalog(
+        &mut self,
+        title: String,
+        custom_name: Option<String>,
+        cwd: String,
+        last_activity: i64,
+    ) {
+        self.title = title;
+        self.custom_name = custom_name;
+        self.cwd = cwd;
+        self.space = space_of(&self.cwd);
+        self.last_activity = last_activity;
+        self.rebuild_search_blob();
+    }
+
+    fn rebuild_search_blob(&mut self) {
+        let mut blob = self.title.to_lowercase();
+        for message in &self.messages {
+            blob.push('\n');
+            blob.push_str(&message.text.to_lowercase());
+        }
+        blob.push('\n');
+        blob.push_str(&self.cwd.to_lowercase());
+        blob.push('\n');
+        blob.push_str(&self.space.to_lowercase());
+        self.search_blob = blob;
     }
 }
 

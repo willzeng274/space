@@ -31,6 +31,10 @@ mkdir -p ~/Desktop/repos
 Needs Rust and git. Optional: `claude`, `codex`, `gh` (PR info), `delta`
 (diff paging). Missing tools degrade gracefully.
 
+Current platform support is macOS with zsh. The Rust core is largely portable,
+but process handoff, URL opening, shell integration, and Windows symlink behavior
+have not yet been ported and verified.
+
 The layout is fixed at compile time and defaults to `~/Desktop` with a
 `repos` pool. Override when building:
 
@@ -41,6 +45,10 @@ SPACE_ROOT=work SPACE_POOL=checkouts cargo build --release
 `SPACE_ROOT` is relative to `$HOME` and may contain slashes. Everything
 follows it: paths, messages, help text, generated policy files.
 
+`space adopt [path]` marks an existing direct child of `SPACE_ROOT` as a
+space without moving or deleting its contents. It refuses generated-file
+collisions and symlinks that do not point to Git repositories in the pool.
+
 macOS: always `rm` before `cp` when replacing the binary. Overwriting in
 place reuses the inode and the signature cache kills it (`Killed: 9`).
 
@@ -48,6 +56,7 @@ place reuses the inode and the signature cache kills it (`Killed: 9`).
 
 ```sh
 space                      # TUI
+space adopt [path]         # convert an existing folder under the space root
 space pull [repo]          # update from origin, ff-only on main, fetch-only on branches
 space add <repo>           # link a pool repo in (bare name or us/<repo>)
 space ls                   # members and pool
@@ -68,11 +77,19 @@ Three panes: spaces, repos, conversations. `Tab` cycles, `j`/`k` move.
 | `s` | stack view: `Enter` opens PR or compare page, `d` diffs vs parent |
 | `u` | close worktree |
 | `x` | remove repo from space |
-| `Enter` | shell cd'd into the selection, TUI exits |
+| `Enter` | shell/resume the selected item, TUI exits |
 | `c` / `o` | launch claude / codex in the space |
 | `/` | search all conversations, `Enter` resumes, `^f` forks |
+| `l` / `Space` | inspect the selected conversation |
+| `r` | rename the selected conversation |
+| `R` | refresh spaces and repo membership from disk |
 | `D` | delete space |
 | `q` | quit |
+
+Inside the conversation inspector, use `j`/`k` for one line, `Ctrl-d`/`Ctrl-u`
+for half a page, `Ctrl-f`/`Ctrl-b` or `PageDown`/`PageUp` for a full page, and
+`g`/`G` for the top or bottom. `r` renames, `Enter` resumes, `f` forks, and
+`h`/`Esc`/`q` closes the inspector.
 
 ## Shell integration
 
@@ -83,7 +100,12 @@ inert. Without it, `space` execs a shell as before.
 
 ## Notes
 
-* Transcripts under `~/.claude` and `~/.codex` are read-only, mtime untouched.
+* Discovery leaves transcripts under `~/.claude` and `~/.codex` untouched.
+  Codex discovery reads `state_5.sqlite`; renames mirror Codex's own SQLite and
+  `session_index.jsonl` writes. Claude renames append the same `custom-title`
+  record used by Claude's `/resume` picker.
 * Agents launch with permission prompts skipped.
-* `space` writes only inside space folders, never the pool.
+* Repo/worktree mutations stay inside space folders and never modify the pool.
+  Concurrent clients keep independent views; layout writes take a shared lock
+  and reject stale snapshots instead of acting on a changed space.
 * `cargo test` covers git ops in temp sandboxes.

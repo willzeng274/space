@@ -226,7 +226,7 @@ fn session_row(s: &Session, now: i64, width: usize) -> ListItem<'static> {
 /// giant prompt doesn't drown the pane.
 const PREVIEW_MSG_MAX_LINES: usize = 14;
 
-fn preview_lines(s: &Session) -> Vec<Line<'static>> {
+fn preview_lines(s: &Session, full: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -261,10 +261,15 @@ fn preview_lines(s: &Session) -> Vec<Line<'static>> {
         )));
 
         let body: Vec<&str> = m.text.lines().collect();
-        for l in body.iter().take(PREVIEW_MSG_MAX_LINES) {
+        let keep = if full {
+            body.len()
+        } else {
+            PREVIEW_MSG_MAX_LINES
+        };
+        for l in body.iter().take(keep) {
             lines.push(Line::from(format!("  {l}")));
         }
-        if body.len() > PREVIEW_MSG_MAX_LINES {
+        if !full && body.len() > PREVIEW_MSG_MAX_LINES {
             lines.push(Line::from(Span::styled(
                 format!("  + {} more lines", body.len() - PREVIEW_MSG_MAX_LINES),
                 Style::default().fg(Color::DarkGray),
@@ -286,9 +291,13 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                     " new space ".to_string(),
                     format!("folder name under {}", crate::space::root_display()),
                 ),
-                InputKind::Branch => (
+                InputKind::Branch { .. } => (
                     " new branch ".to_string(),
                     "branch for the worktree".to_string(),
+                ),
+                InputKind::Rename { .. } => (
+                    " rename conversation ".to_string(),
+                    "user-facing conversation name".to_string(),
                 ),
             };
             let area = centered(50, 5, f.area());
@@ -469,7 +478,7 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                 .padding(Padding::horizontal(1));
             match selected {
                 Some(s) => {
-                    let p = Paragraph::new(Text::from(preview_lines(s)))
+                    let p = Paragraph::new(Text::from(preview_lines(s, false)))
                         .block(preview_block)
                         .wrap(Wrap { trim: false })
                         .scroll((*preview_scroll, 0));
@@ -483,6 +492,47 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                         cols[1],
                     );
                 }
+            }
+        }
+        Modal::Inspector {
+            session_index,
+            scroll,
+            page_height,
+        } => {
+            let area = centered_pct(96, 92, f.area());
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(" conversation ");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            *page_height = rows[0].height.max(1);
+
+            if let Some(session) = app.sessions.get(*session_index) {
+                let mut paragraph = Paragraph::new(Text::from(preview_lines(session, true)))
+                    .wrap(Wrap { trim: false });
+                let line_count =
+                    u16::try_from(paragraph.line_count(rows[0].width)).unwrap_or(u16::MAX);
+                let max_scroll = line_count.saturating_sub(rows[0].height);
+                *scroll = if *scroll == u16::MAX {
+                    max_scroll
+                } else {
+                    (*scroll).min(max_scroll)
+                };
+                paragraph = paragraph.scroll((*scroll, 0));
+                f.render_widget(paragraph, rows[0]);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "j/k line  ^u/^d half-page  ^b/^f page  g/G ends  r rename  Enter resume  f fork  h/Esc close",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    rows[1],
+                );
             }
         }
         Modal::Stack {
@@ -649,7 +699,9 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
                 rows[1],
             );
         }
-        Modal::ConfirmRepo { kind, repo, branch } => {
+        Modal::ConfirmRepo {
+            kind, repo, branch, ..
+        } => {
             let (title, question, detail) = match kind {
                 RepoConfirm::Remove => (
                     " remove worktree ",
@@ -664,7 +716,7 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
             };
             draw_confirm(f, title, &question, detail, ACCENT);
         }
-        Modal::ConfirmDeleteSpace { name } => {
+        Modal::ConfirmDeleteSpace { name, .. } => {
             draw_confirm(
                 f,
                 " delete space ",
@@ -809,6 +861,7 @@ fn draw_hint(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new space"),
             ("a", "add repo"),
             ("p", "pull"),
+            ("R", "refresh"),
             ("/", "search"),
             ("Enter", "shell"),
             ("c", "claude"),
@@ -821,6 +874,7 @@ fn draw_hint(f: &mut Frame, app: &App, area: Rect) {
             ("Tab", "pane"),
             ("a", "add"),
             ("p", "pull"),
+            ("R", "refresh"),
             ("w", "worktree"),
             ("s", "stack"),
             ("u", "symlink"),
@@ -833,9 +887,12 @@ fn draw_hint(f: &mut Frame, app: &App, area: Rect) {
         Pane::Convos => hint_spans(&[
             ("j/k", "move"),
             ("Tab", "pane"),
+            ("l/Space", "inspect"),
+            ("r", "rename"),
             ("Enter", "resume"),
             ("f", "fork"),
             ("/", "search all"),
+            ("R", "refresh"),
             ("q", "quit"),
         ]),
     };

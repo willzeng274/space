@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::data::{Backend, Session, now_epoch};
-use crate::space::{self, PoolRepo, RepoState, Space, SpaceRepo};
+use crate::space::{self, PoolRepo, RepoState, Space, SpaceRepo, SpaceRevision};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Pane {
@@ -15,7 +15,15 @@ pub enum Pane {
 
 pub enum InputKind {
     NewSpace,
-    Branch,
+    Branch {
+        space: PathBuf,
+        repo: String,
+        revision: SpaceRevision,
+    },
+    Rename {
+        session_index: usize,
+        return_to_inspector: bool,
+    },
 }
 
 pub enum Modal {
@@ -31,6 +39,8 @@ pub enum Modal {
         candidates: Vec<PickerItem>,
         filter: String,
         state: ListState,
+        space: PathBuf,
+        revision: SpaceRevision,
     },
     /// Global conversation search: filter over every session's title + text,
     /// with a live preview. Enter resumes, ^f forks.
@@ -41,14 +51,23 @@ pub enum Modal {
         state: ListState,
         preview_scroll: u16,
     },
+    Inspector {
+        session_index: usize,
+        scroll: u16,
+        page_height: u16,
+    },
     ConfirmDeleteSpace {
         name: String,
+        path: PathBuf,
+        revision: SpaceRevision,
     },
     /// Confirm a worktree-affecting repo action (`x` remove / `u` to-symlink).
     ConfirmRepo {
         kind: RepoConfirm,
         repo: String,
         branch: String,
+        space: PathBuf,
+        revision: SpaceRevision,
     },
     /// Per-repo outcome of a space pull; any key closes.
     PullResults {
@@ -242,9 +261,37 @@ impl App {
     // ---- sessions ------------------------------------------------------------
 
     pub fn add_session(&mut self, s: Session) {
+        // Loader results arrive while the UI is already interactive. Preserve
+        // any modal's selected conversation across the newest-first re-sort.
+        let tracked = match &self.modal {
+            Modal::Inspector { session_index, .. }
+            | Modal::Input {
+                kind: InputKind::Rename { session_index, .. },
+                ..
+            } => self
+                .sessions
+                .get(*session_index)
+                .map(|session| (session.backend, session.id.clone())),
+            _ => None,
+        };
         self.sessions.push(s);
         self.sessions
             .sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        if let Some((backend, id)) = tracked
+            && let Some(new_index) = self
+                .sessions
+                .iter()
+                .position(|session| session.backend == backend && session.id == id)
+        {
+            match &mut self.modal {
+                Modal::Inspector { session_index, .. }
+                | Modal::Input {
+                    kind: InputKind::Rename { session_index, .. },
+                    ..
+                } => *session_index = new_index,
+                _ => {}
+            }
+        }
         // Keep an open search consistent while sessions stream in.
         if let Modal::ConvoSearch {
             filter, matches, ..
@@ -603,6 +650,55 @@ impl App {
         Effect::None
     }
 
+    fn on_inspector_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Effect {
+        let (idx, page) = match &self.modal {
+            Modal::Inspector {
+                session_index,
+                page_height,
+                ..
+            } => (*session_index, (*page_height).max(2)),
+            _ => return Effect::None,
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.modal = Modal::None,
+            KeyCode::Enter => {
+                self.modal = Modal::None;
+                return self.resume_index(Some(idx), false);
+            }
+            KeyCode::Char('f') if !mods.contains(KeyModifiers::CONTROL) => {
+                self.modal = Modal::None;
+                return self.resume_index(Some(idx), true);
+            }
+            KeyCode::Char('r') => self.open_rename(Some(idx), true),
+            _ => {
+                if let Modal::Inspector { scroll, .. } = &mut self.modal {
+                    match code {
+                        KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                            *scroll = scroll.saturating_sub(page / 2)
+                        }
+                        KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => {
+                            *scroll = scroll.saturating_add(page / 2)
+                        }
+                        KeyCode::Char('b') if mods.contains(KeyModifiers::CONTROL) => {
+                            *scroll = scroll.saturating_sub(page)
+                        }
+                        KeyCode::Char('f') if mods.contains(KeyModifiers::CONTROL) => {
+                            *scroll = scroll.saturating_add(page)
+                        }
+                        KeyCode::PageUp => *scroll = scroll.saturating_sub(page),
+                        KeyCode::PageDown => *scroll = scroll.saturating_add(page),
+                        KeyCode::Char('g') => *scroll = 0,
+                        KeyCode::Char('G') => *scroll = u16::MAX,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Effect::None
+    }
+
     // ---- key handling ----------------------------------------------------------
 
     pub fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Effect {
@@ -620,6 +716,7 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.open_convo_search(),
+            KeyCode::Char('R') => self.reload_spaces(),
             KeyCode::Char('n') => {
                 self.modal = Modal::Input {
                     kind: InputKind::NewSpace,
@@ -634,6 +731,8 @@ impl App {
                 if let Some(s) = self.selected_space() {
                     self.modal = Modal::ConfirmDeleteSpace {
                         name: s.name.clone(),
+                        path: s.path.clone(),
+                        revision: s.revision.clone(),
                     };
                 }
             }
@@ -692,12 +791,15 @@ impl App {
             KeyCode::Char('w') => {
                 // Any managed member works: a new `<repo>-<branch>` worktree is
                 // added beside it (parallel worktrees are fine).
-                if matches!(
-                    self.selected_repo().map(|r| &r.state),
-                    Some(RepoState::Symlink) | Some(RepoState::Worktree { .. })
-                ) {
+                if let (Some(space), Some(repo)) = (self.selected_space(), self.selected_repo())
+                    && matches!(repo.state, RepoState::Symlink | RepoState::Worktree { .. })
+                {
                     self.modal = Modal::Input {
-                        kind: InputKind::Branch,
+                        kind: InputKind::Branch {
+                            space: space.path.clone(),
+                            repo: repo.name.clone(),
+                            revision: space.revision.clone(),
+                        },
                         buffer: String::new(),
                     };
                 } else {
@@ -706,13 +808,15 @@ impl App {
             }
             KeyCode::Char('s') => self.open_stack(),
             KeyCode::Char('u') => {
-                if let Some(r) = self.selected_repo() {
+                if let (Some(space), Some(r)) = (self.selected_space(), self.selected_repo()) {
                     match &r.state {
                         RepoState::Worktree { branch } => {
                             self.modal = Modal::ConfirmRepo {
                                 kind: RepoConfirm::ToSymlink,
                                 repo: r.name.clone(),
                                 branch: branch.clone(),
+                                space: space.path.clone(),
+                                revision: space.revision.clone(),
                             };
                         }
                         _ => self.status = Some("that repo is not a worktree".into()),
@@ -721,13 +825,15 @@ impl App {
             }
             KeyCode::Char('x') => {
                 // Removing a symlink is trivially reversible; worktrees confirm.
-                if let Some(r) = self.selected_repo() {
+                if let (Some(space), Some(r)) = (self.selected_space(), self.selected_repo()) {
                     match &r.state {
                         RepoState::Worktree { branch } => {
                             self.modal = Modal::ConfirmRepo {
                                 kind: RepoConfirm::Remove,
                                 repo: r.name.clone(),
                                 branch: branch.clone(),
+                                space: space.path.clone(),
+                                revision: space.revision.clone(),
                             };
                         }
                         _ => self.remove_selected_repo(),
@@ -755,6 +861,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => Self::move_list(&mut self.convo_state, n, 1),
             KeyCode::Up | KeyCode::Char('k') => Self::move_list(&mut self.convo_state, n, -1),
             KeyCode::Left | KeyCode::Char('h') => self.pane = Pane::Spaces,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                self.open_inspector(self.selected_space_session_index())
+            }
+            KeyCode::Char('r') => self.open_rename(self.selected_space_session_index(), false),
             KeyCode::Enter => return self.resume_index(self.selected_space_session_index(), false),
             KeyCode::Char('f') => {
                 return self.resume_index(self.selected_space_session_index(), true);
@@ -772,12 +882,16 @@ impl App {
         if matches!(self.modal, Modal::StackDiff { .. }) {
             return self.on_stack_diff_key(code, mods);
         }
+        if matches!(self.modal, Modal::Inspector { .. }) {
+            return self.on_inspector_key(code, mods);
+        }
         match &mut self.modal {
             Modal::Input { buffer, .. } => match code {
-                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Esc => self.cancel_input(),
                 KeyCode::Backspace => {
                     buffer.pop();
                 }
+                KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => buffer.clear(),
                 KeyCode::Char(c) => buffer.push(c),
                 KeyCode::Enter => self.commit_input(),
                 _ => {}
@@ -787,6 +901,7 @@ impl App {
                 candidates,
                 filter,
                 state,
+                ..
             } => match code {
                 KeyCode::Esc => self.modal = Modal::None,
                 KeyCode::Up => Self::move_list(state, candidates.len(), -1),
@@ -848,24 +963,38 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::ConfirmDeleteSpace { .. } => match code {
-                KeyCode::Char('y') => self.do_delete_space(),
+            Modal::ConfirmDeleteSpace { path, revision, .. } => match code {
+                KeyCode::Char('y') => {
+                    let path = path.clone();
+                    let revision = revision.clone();
+                    self.modal = Modal::None;
+                    self.do_delete_space(path, revision);
+                }
                 _ => self.modal = Modal::None,
             },
-            Modal::ConfirmRepo { kind, .. } => match code {
+            Modal::ConfirmRepo {
+                kind,
+                repo,
+                space,
+                revision,
+                ..
+            } => match code {
                 KeyCode::Char('y') => {
                     let kind = *kind;
+                    let repo = repo.clone();
+                    let space = space.clone();
+                    let revision = revision.clone();
                     self.modal = Modal::None;
                     match kind {
-                        RepoConfirm::Remove => self.remove_selected_repo(),
-                        RepoConfirm::ToSymlink => self.revert_selected_repo(),
+                        RepoConfirm::Remove => self.remove_repo(space, repo, revision),
+                        RepoConfirm::ToSymlink => self.revert_repo(space, repo, revision),
                     }
                 }
                 _ => self.modal = Modal::None,
             },
             Modal::PullResults { .. } => self.modal = Modal::None,
             // Routed to dedicated handlers before this match; unreachable here.
-            Modal::Stack { .. } | Modal::StackDiff { .. } => {}
+            Modal::Stack { .. } | Modal::StackDiff { .. } | Modal::Inspector { .. } => {}
             Modal::None => {}
         }
         Effect::None
@@ -882,6 +1011,34 @@ impl App {
             matches,
             state,
             preview_scroll: 0,
+        };
+    }
+
+    fn open_inspector(&mut self, idx: Option<usize>) {
+        let Some(session_index) = idx.filter(|&i| i < self.sessions.len()) else {
+            return;
+        };
+        self.modal = Modal::Inspector {
+            session_index,
+            scroll: 0,
+            page_height: 20,
+        };
+    }
+
+    fn open_rename(&mut self, idx: Option<usize>, return_to_inspector: bool) {
+        let Some(session_index) = idx.filter(|&i| i < self.sessions.len()) else {
+            return;
+        };
+        let buffer = self.sessions[session_index]
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| self.sessions[session_index].title.clone());
+        self.modal = Modal::Input {
+            kind: InputKind::Rename {
+                session_index,
+                return_to_inspector,
+            },
+            buffer,
         };
     }
 
@@ -916,6 +1073,8 @@ impl App {
             self.status = Some(format!("no repos in {} to add", space::pool_display()));
             return;
         }
+        let space_path = space.path.clone();
+        let revision = space.revision.clone();
         let present: Vec<&str> = space.repos.iter().map(|r| r.name.as_str()).collect();
         // Pool names may be group-qualified (`acme/api`); the space links by basename.
         let mut all: Vec<PickerItem> = self
@@ -937,6 +1096,8 @@ impl App {
             candidates: all,
             filter: String::new(),
             state: selected0(),
+            space: space_path,
+            revision,
         };
     }
 
@@ -945,15 +1106,74 @@ impl App {
             return;
         };
         let buffer = buffer.clone();
+        let rename_target = match kind {
+            InputKind::Rename {
+                session_index,
+                return_to_inspector,
+            } => Some((*session_index, *return_to_inspector)),
+            _ => None,
+        };
+        if let Some((session_index, return_to_inspector)) = rename_target {
+            let name = buffer.trim();
+            if name.is_empty() {
+                self.status = Some("conversation name cannot be empty".into());
+                self.modal = Modal::None;
+                return;
+            }
+            let Some(session) = self.sessions.get(session_index) else {
+                self.modal = Modal::None;
+                return;
+            };
+            let backend = session.backend;
+            let id = session.id.clone();
+            let result = match backend {
+                Backend::Codex => crate::codex::set_thread_name(&id, name),
+                Backend::Claude => crate::claude::set_session_name(&id, name),
+            };
+            match result {
+                Ok(()) => {
+                    self.sessions[session_index]
+                        .set_title(name.to_string(), Some(name.to_string()));
+                    self.modal = if return_to_inspector {
+                        Modal::Inspector {
+                            session_index,
+                            scroll: 0,
+                            page_height: 20,
+                        }
+                    } else {
+                        Modal::None
+                    };
+                    self.status = Some(match backend {
+                        Backend::Codex => "Codex conversation renamed".into(),
+                        Backend::Claude => "Claude conversation renamed".into(),
+                    });
+                }
+                Err(e) => {
+                    self.status = Some(e.to_string());
+                    self.modal = if return_to_inspector {
+                        Modal::Inspector {
+                            session_index,
+                            scroll: 0,
+                            page_height: 20,
+                        }
+                    } else {
+                        Modal::None
+                    };
+                }
+            }
+            return;
+        }
+
         let result = match kind {
             InputKind::NewSpace => space::create_space(&buffer).map(|_| ()),
-            InputKind::Branch => match (self.selected_space(), self.selected_repo()) {
-                (Some(space), Some(repo)) => {
-                    space::promote_to_worktree(&space.path.clone(), &repo.name.clone(), &buffer)
-                        .map(|_| ())
-                }
-                _ => Ok(()),
-            },
+            InputKind::Branch {
+                space,
+                repo,
+                revision,
+            } => {
+                space::promote_to_worktree_from_snapshot(space, repo, &buffer, revision).map(|_| ())
+            }
+            InputKind::Rename { .. } => unreachable!(),
         };
         match result {
             Ok(()) => {
@@ -967,12 +1187,33 @@ impl App {
         }
     }
 
+    fn cancel_input(&mut self) {
+        let inspector = match &self.modal {
+            Modal::Input {
+                kind:
+                    InputKind::Rename {
+                        session_index,
+                        return_to_inspector: true,
+                    },
+                ..
+            } => Some(*session_index),
+            _ => None,
+        };
+        self.modal = inspector.map_or(Modal::None, |session_index| Modal::Inspector {
+            session_index,
+            scroll: 0,
+            page_height: 20,
+        });
+    }
+
     fn commit_picker(&mut self) {
-        let (repo, space_path, keep_filter) = {
+        let (repo, space_path, revision, keep_filter) = {
             let Modal::RepoPicker {
                 candidates,
                 state,
                 filter,
+                space,
+                revision,
                 ..
             } = &self.modal
             else {
@@ -985,12 +1226,9 @@ impl App {
                 self.status = Some(format!("{} is already in this space", item.name));
                 return;
             }
-            let Some(space) = self.selected_space() else {
-                return;
-            };
-            (item.name, space.path.clone(), filter.clone())
+            (item.name, space.clone(), revision.clone(), filter.clone())
         };
-        match space::add_repo(&space_path, &repo) {
+        match space::add_repo_from_snapshot(&space_path, &repo, &revision) {
             Ok(()) => {
                 self.reload_spaces();
                 // Reopen with a fresh candidate list (and the filter kept) so
@@ -1001,6 +1239,7 @@ impl App {
                     candidates,
                     filter,
                     state,
+                    ..
                 } = &mut self.modal
                 {
                     *filter = keep_filter;
@@ -1014,19 +1253,8 @@ impl App {
         }
     }
 
-    fn revert_selected_repo(&mut self) {
-        let Some(repo) = self.selected_repo() else {
-            return;
-        };
-        if !matches!(repo.state, RepoState::Worktree { .. }) {
-            self.status = Some("that repo is not a worktree".into());
-            return;
-        }
-        let (name, path) = (
-            repo.name.clone(),
-            self.selected_space().unwrap().path.clone(),
-        );
-        if let Err(e) = space::revert_to_symlink(&path, &name) {
+    fn revert_repo(&mut self, path: PathBuf, name: String, revision: SpaceRevision) {
+        if let Err(e) = space::revert_to_symlink_from_snapshot(&path, &name, &revision) {
             self.status = Some(e.to_string());
         }
         self.reload_spaces();
@@ -1036,11 +1264,16 @@ impl App {
         let Some(repo) = self.selected_repo() else {
             return;
         };
-        let (name, path) = (
+        let (name, path, revision) = (
             repo.name.clone(),
             self.selected_space().unwrap().path.clone(),
+            self.selected_space().unwrap().revision.clone(),
         );
-        if let Err(e) = space::remove_repo(&path, &name) {
+        self.remove_repo(path, name, revision);
+    }
+
+    fn remove_repo(&mut self, path: PathBuf, name: String, revision: SpaceRevision) {
+        if let Err(e) = space::remove_repo_from_snapshot(&path, &name, &revision) {
             self.status = Some(e.to_string());
         }
         self.reload_spaces();
@@ -1053,13 +1286,8 @@ impl App {
         }
     }
 
-    fn do_delete_space(&mut self) {
-        self.modal = Modal::None;
-        let Some(space) = self.selected_space() else {
-            return;
-        };
-        let path = space.path.clone();
-        if let Err(e) = space::delete_space(&path) {
+    fn do_delete_space(&mut self, path: PathBuf, revision: SpaceRevision) {
+        if let Err(e) = space::delete_space_from_snapshot(&path, &revision) {
             self.status = Some(e.to_string());
         }
         self.pane = Pane::Spaces;

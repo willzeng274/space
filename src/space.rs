@@ -9,8 +9,12 @@
 //!   are symlinks into the pool (default) or git worktrees (once a branch is made).
 //!   Membership is derived from the filesystem, so config never drifts from reality.
 
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -62,11 +66,74 @@ pub struct SpaceRepo {
     pub state: RepoState,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceRevision {
+    entries: Vec<(OsString, EntryIdentity)>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EntryIdentity {
+    Symlink(PathBuf),
+    Worktree(Vec<u8>),
+    Directory,
+    File {
+        len: u64,
+        modified: Option<SystemTime>,
+        created: Option<SystemTime>,
+    },
+    Other,
+}
+
 #[derive(Clone, Debug)]
 pub struct Space {
     pub name: String,
     pub path: PathBuf,
     pub repos: Vec<SpaceRepo>,
+    pub revision: SpaceRevision,
+}
+
+#[derive(Debug)]
+struct LayoutLock {
+    _file: File,
+}
+
+impl LayoutLock {
+    fn acquire(root: &Path) -> Result<Self> {
+        let path = root.join(".space-tool.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening layout lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!(
+                    "another space client is changing the layout at {}; retry",
+                    root.display()
+                )
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
+    fn for_space(space: &Path) -> Result<Self> {
+        let root = space
+            .parent()
+            .ok_or_else(|| anyhow!("space {} has no managed root", space.display()))?;
+        Self::acquire(root)
+    }
+}
+
+impl Drop for LayoutLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
 }
 
 pub fn desktop_dir() -> Option<PathBuf> {
@@ -209,7 +276,87 @@ fn read_space(path: &Path) -> Space {
         name,
         path: path.to_path_buf(),
         repos,
+        revision: space_revision(path),
     }
+}
+
+fn space_revision(path: &Path) -> SpaceRevision {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let workspace = workspace_filename(&name);
+    let mut entries = Vec::new();
+    let mut complete = true;
+    match std::fs::read_dir(path) {
+        Ok(iter) => {
+            for entry in iter {
+                let Ok(entry) = entry else {
+                    complete = false;
+                    continue;
+                };
+                let filename = entry.file_name();
+                if filename == "CLAUDE.md"
+                    || filename == "AGENTS.md"
+                    || filename == workspace.as_str()
+                {
+                    continue;
+                }
+                let entry_path = entry.path();
+                let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+                    complete = false;
+                    continue;
+                };
+                let identity = if metadata.file_type().is_symlink() {
+                    match std::fs::read_link(&entry_path) {
+                        Ok(target) => EntryIdentity::Symlink(target),
+                        Err(_) => EntryIdentity::Other,
+                    }
+                } else if metadata.is_dir() {
+                    match std::fs::read(entry_path.join(".git")) {
+                        Ok(git_file) if git_file.starts_with(b"gitdir:") => {
+                            EntryIdentity::Worktree(git_file)
+                        }
+                        _ => EntryIdentity::Directory,
+                    }
+                } else if metadata.is_file() {
+                    EntryIdentity::File {
+                        len: metadata.len(),
+                        modified: metadata.modified().ok(),
+                        created: metadata.created().ok(),
+                    }
+                } else {
+                    EntryIdentity::Other
+                };
+                entries.push((filename, identity));
+            }
+        }
+        Err(_) => complete = false,
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    SpaceRevision { entries, complete }
+}
+
+fn ensure_revision(space: &Path, expected: Option<&SpaceRevision>) -> Result<()> {
+    if !is_space(space) {
+        bail!(
+            "{} is no longer a space; refresh and retry",
+            space.display()
+        );
+    }
+    let actual = space_revision(space);
+    if !actual.complete {
+        bail!("could not completely verify the space layout; refresh and retry");
+    }
+    if let Some(expected) = expected {
+        if !expected.complete {
+            bail!("could not completely verify the space layout; refresh and retry");
+        }
+        if &actual != expected {
+            bail!("space changed in another client; refresh and retry");
+        }
+    }
+    Ok(())
 }
 
 // ---- git helpers ----------------------------------------------------------
@@ -258,6 +405,143 @@ fn is_git_worktree(dir: &Path) -> bool {
 
 // ---- mutations ------------------------------------------------------------
 
+pub fn adopt_space(path: &Path) -> Result<PathBuf> {
+    let root = desktop_dir().ok_or_else(|| anyhow!("cannot locate {}", root_display()))?;
+    adopt_space_at(&root, path)
+}
+
+fn adopt_space_at(root: &Path, path: &Path) -> Result<PathBuf> {
+    let metadata =
+        std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{} is not a real directory", path.display());
+    }
+
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("resolving managed root {}", root.display()))?;
+    let path =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    if path.parent() != Some(root.as_path()) {
+        bail!(
+            "{} is not a direct child of the managed root {}",
+            path.display(),
+            root.display()
+        );
+    }
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name == POOL_DIR {
+        bail!("`{POOL_DIR}` is reserved for the canonical repo pool");
+    }
+    if name.is_empty() || name.starts_with('.') {
+        bail!("invalid space name");
+    }
+
+    let _lock = LayoutLock::acquire(&root)?;
+    if is_space(&path) {
+        bail!("{} is already a space", path.display());
+    }
+
+    let workspace = workspace_filename(&name);
+    let generated = [MARKER, "CLAUDE.md", "AGENTS.md", workspace.as_str()];
+    for filename in generated {
+        let candidate = path.join(filename);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            bail!(
+                "cannot adopt without overwriting {}; move or rename it first",
+                candidate.display()
+            );
+        }
+    }
+
+    validate_adopted_members(&root, &path)?;
+    let policy = policy_markdown(&name);
+    let workspace_content = workspace_json(&read_space(&path));
+    let marker = marker_content(&name);
+    create_adoption_files(
+        &[
+            (path.join("CLAUDE.md"), policy.as_bytes()),
+            (path.join("AGENTS.md"), policy.as_bytes()),
+            (path.join(&workspace), workspace_content.as_bytes()),
+            (path.join(MARKER), marker.as_bytes()),
+        ],
+        &path,
+    )?;
+    Ok(path)
+}
+
+fn validate_adopted_members(root: &Path, space: &Path) -> Result<()> {
+    let pool = root.join(POOL_DIR);
+    let pool = std::fs::canonicalize(&pool)
+        .with_context(|| format!("resolving repo pool {}", pool.display()))?;
+    for entry in std::fs::read_dir(space).with_context(|| format!("reading {}", space.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let repo = if metadata.file_type().is_symlink() {
+            Some(
+                std::fs::canonicalize(&path)
+                    .with_context(|| format!("resolving symlink {}", path.display()))?,
+            )
+        } else if metadata.is_dir() && linked_worktree_branch(&path).is_some() {
+            Some(canonical_of_worktree(&path)?)
+        } else {
+            None
+        };
+        let Some(repo) = repo else {
+            continue;
+        };
+        let repo = std::fs::canonicalize(&repo)
+            .with_context(|| format!("resolving repository {}", repo.display()))?;
+        if repo == pool || !repo.starts_with(&pool) || !repo.join(".git").exists() {
+            bail!(
+                "{} is not linked to a repository in {}; leaving the folder unchanged",
+                path.display(),
+                pool.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn create_adoption_files(files: &[(PathBuf, &[u8])], space: &Path) -> Result<()> {
+    let mut created = Vec::new();
+    for (path, content) in files {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => file,
+            Err(error) => return Err(adoption_error(space, &created, error)),
+        };
+        created.push(path.clone());
+        if let Err(error) = file.write_all(content) {
+            drop(file);
+            return Err(adoption_error(space, &created, error));
+        }
+    }
+    Ok(())
+}
+
+fn adoption_error(space: &Path, created: &[PathBuf], error: std::io::Error) -> anyhow::Error {
+    let mut cleanup_errors = Vec::new();
+    for path in created.iter().rev() {
+        if let Err(error) = std::fs::remove_file(path) {
+            cleanup_errors.push(format!("{}: {error}", path.display()));
+        }
+    }
+    let cleanup = if cleanup_errors.is_empty() {
+        String::new()
+    } else {
+        format!("; cleanup also failed for {}", cleanup_errors.join(", "))
+    };
+    anyhow!("adopting {} failed: {error}{cleanup}", space.display())
+}
+
+fn marker_content(name: &str) -> String {
+    format!("# managed by `space`; presence marks this folder as a space\nname = \"{name}\"\n")
+}
+
 /// Create a new space folder with the marker and both agent policy files.
 pub fn create_space(name: &str) -> Result<PathBuf> {
     let name = name.trim();
@@ -271,22 +555,20 @@ pub fn create_space(name: &str) -> Result<PathBuf> {
         bail!("invalid space name");
     }
     let desktop = desktop_dir().ok_or_else(|| anyhow!("cannot locate {}", root_display()))?;
+    let _lock = LayoutLock::acquire(&desktop)?;
     let path = desktop.join(name);
     if path.exists() {
         bail!("{}/{name} already exists", root_display());
     }
     std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
     write_space_files(&path, name)?;
-    refresh_policy_files(&path)?;
+    refresh_policy_files_unlocked(&path)?;
     Ok(path)
 }
 
 /// (Re)write the marker + CLAUDE.md/AGENTS.md so the policy stays in sync.
 pub fn write_space_files(space: &Path, name: &str) -> Result<()> {
-    std::fs::write(
-        space.join(MARKER),
-        format!("# managed by `space`; presence marks this folder as a space\nname = \"{name}\"\n"),
-    )?;
+    std::fs::write(space.join(MARKER), marker_content(name))?;
     let policy = policy_markdown(name);
     std::fs::write(space.join("CLAUDE.md"), &policy)?;
     std::fs::write(space.join("AGENTS.md"), &policy)?;
@@ -314,6 +596,12 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
 /// VS Code `.code-workspace`) up to date with this binary's template and the
 /// space's current membership. No-op (no writes, no mtime churn) when current.
 pub fn refresh_policy_files(space: &Path) -> Result<()> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, None)?;
+    refresh_policy_files_unlocked(space)
+}
+
+fn refresh_policy_files_unlocked(space: &Path) -> Result<()> {
     let name = space
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -412,6 +700,24 @@ pub fn members(space: &Path) -> Vec<SpaceRepo> {
 /// include a group (`acme/api`); the link in the space is named by the
 /// repo's basename.
 pub fn add_repo(space: &Path, repo: &str) -> Result<()> {
+    add_repo_with_revision(space, repo, None)
+}
+
+pub fn add_repo_from_snapshot(space: &Path, repo: &str, revision: &SpaceRevision) -> Result<()> {
+    add_repo_with_revision(space, repo, Some(revision))
+}
+
+fn add_repo_with_revision(
+    space: &Path,
+    repo: &str,
+    revision: Option<&SpaceRevision>,
+) -> Result<()> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, revision)?;
+    add_repo_unlocked(space, repo)
+}
+
+fn add_repo_unlocked(space: &Path, repo: &str) -> Result<()> {
     let pool = pool_for(space).ok_or_else(|| anyhow!("cannot locate the repo pool"))?;
     let src = pool.join(repo);
     if !src.is_dir() {
@@ -430,6 +736,24 @@ pub fn add_repo(space: &Path, repo: &str) -> Result<()> {
 
 /// Remove a repo from a space (unlink a symlink, or `git worktree remove`).
 pub fn remove_repo(space: &Path, repo: &str) -> Result<()> {
+    remove_repo_with_revision(space, repo, None)
+}
+
+pub fn remove_repo_from_snapshot(space: &Path, repo: &str, revision: &SpaceRevision) -> Result<()> {
+    remove_repo_with_revision(space, repo, Some(revision))
+}
+
+fn remove_repo_with_revision(
+    space: &Path,
+    repo: &str,
+    revision: Option<&SpaceRevision>,
+) -> Result<()> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, revision)?;
+    remove_repo_unlocked(space, repo)
+}
+
+fn remove_repo_unlocked(space: &Path, repo: &str) -> Result<()> {
     let dst = space.join(repo);
     let meta = std::fs::symlink_metadata(&dst)
         .with_context(|| format!("`{repo}` is not in this space"))?;
@@ -467,7 +791,8 @@ fn remove_worktree_safely(canonical: &Path, dst: &Path, repo: &str) -> Result<()
         let from = dst.join(rel);
         let to = canonical.join(rel);
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         std::fs::copy(&from, &to)
             .with_context(|| format!("carrying {rel} back to the canonical repo"))?;
@@ -501,6 +826,26 @@ pub fn worktree_dir_name(repo: &str, branch: &str) -> String {
 /// a branch can be checked out in at most one worktree at a time. Loose
 /// untracked files and gitignored `*.md` notes are copied in.
 pub fn promote_to_worktree(space: &Path, repo: &str, branch: &str) -> Result<String> {
+    promote_to_worktree_with_revision(space, repo, branch, None)
+}
+
+pub fn promote_to_worktree_from_snapshot(
+    space: &Path,
+    repo: &str,
+    branch: &str,
+    revision: &SpaceRevision,
+) -> Result<String> {
+    promote_to_worktree_with_revision(space, repo, branch, Some(revision))
+}
+
+fn promote_to_worktree_with_revision(
+    space: &Path,
+    repo: &str,
+    branch: &str,
+    revision: Option<&SpaceRevision>,
+) -> Result<String> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, revision)?;
     let branch = branch.trim();
     if branch.is_empty() {
         bail!("branch name cannot be empty");
@@ -536,7 +881,9 @@ pub fn promote_to_worktree(space: &Path, repo: &str, branch: &str) -> Result<Str
     // New branch if possible, else check out an existing one into the worktree.
     git(&canonical, &["worktree", "add", &dst_str, "-b", branch])
         .or_else(|_| git(&canonical, &["worktree", "add", &dst_str, branch]))?;
-    copy_loose_files(&canonical, &dst)?;
+    copy_loose_files(&canonical, &dst).with_context(|| {
+        format!("worktree {name} was created, but its loose files were not completely copied")
+    })?;
     Ok(name)
 }
 
@@ -544,15 +891,30 @@ pub fn promote_to_worktree(space: &Path, repo: &str, branch: &str) -> Result<Str
 /// closing branch work always lands back on the canonical view. Handles both
 /// branch-named worktrees and legacy swap-style ones under the bare repo name.
 pub fn revert_to_symlink(space: &Path, member: &str) -> Result<()> {
+    revert_to_symlink_with_revision(space, member, None)
+}
+
+pub fn revert_to_symlink_from_snapshot(
+    space: &Path,
+    member: &str,
+    revision: &SpaceRevision,
+) -> Result<()> {
+    revert_to_symlink_with_revision(space, member, Some(revision))
+}
+
+fn revert_to_symlink_with_revision(
+    space: &Path,
+    member: &str,
+    revision: Option<&SpaceRevision>,
+) -> Result<()> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, revision)?;
     let dst = space.join(member);
     if !is_git_worktree(&dst) {
         bail!("`{member}` is not a worktree");
     }
     let canonical = canonical_of_worktree(&dst)?;
     remove_worktree_safely(&canonical, &dst, member)?;
-    if dst.exists() {
-        std::fs::remove_dir_all(&dst).ok();
-    }
     let base = canonical
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -569,6 +931,16 @@ pub fn revert_to_symlink(space: &Path, member: &str) -> Result<()> {
 /// touching anything, if the space holds files or dirs the tool didn't create,
 /// so a rejected delete never leaves a half-dismantled space.
 pub fn delete_space(space: &Path) -> Result<()> {
+    delete_space_with_revision(space, None)
+}
+
+pub fn delete_space_from_snapshot(space: &Path, revision: &SpaceRevision) -> Result<()> {
+    delete_space_with_revision(space, Some(revision))
+}
+
+fn delete_space_with_revision(space: &Path, revision: Option<&SpaceRevision>) -> Result<()> {
+    let _lock = LayoutLock::for_space(space)?;
+    ensure_revision(space, revision)?;
     if !is_space(space) {
         bail!("not a space");
     }
@@ -579,37 +951,44 @@ pub fn delete_space(space: &Path) -> Result<()> {
     let ws = workspace_filename(&name);
 
     let s = read_space(space);
-    if let Some(foreign) = s.repos.iter().find(|r| r.state == RepoState::Foreign) {
-        bail!(
-            "`{}` is not space-managed; remove it by hand first",
-            foreign.name
-        );
+    let mut unmanaged = Vec::new();
+    for entry in std::fs::read_dir(space).with_context(|| format!("reading {}", space.display()))? {
+        let entry = entry?;
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if filename == MARKER
+            || filename == "CLAUDE.md"
+            || filename == "AGENTS.md"
+            || filename == ws
+        {
+            continue;
+        }
+        let managed = s
+            .repos
+            .iter()
+            .any(|repo| repo.name == filename && repo.state != RepoState::Foreign);
+        if !managed {
+            unmanaged.push(filename);
+        }
     }
-    // Scratch notes at the root are the user's; refuse before dismantling anything.
-    let notes: Vec<String> = std::fs::read_dir(space)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().is_file())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|f| !f.starts_with('.') && f != "CLAUDE.md" && f != "AGENTS.md" && *f != ws)
-                .collect()
-        })
-        .unwrap_or_default();
-    if !notes.is_empty() {
+    if !unmanaged.is_empty() {
+        unmanaged.sort();
         bail!(
-            "space contains your files ({}); move or delete them first",
-            notes.join(", ")
+            "space contains non-managed entries ({}); move or delete them first",
+            unmanaged.join(", ")
         );
     }
 
     for r in &s.repos {
-        remove_repo(space, &r.name)?;
+        remove_repo_unlocked(space, &r.name)?;
     }
-    for f in [MARKER, "CLAUDE.md", "AGENTS.md", ws.as_str()] {
+    for f in ["CLAUDE.md", "AGENTS.md", ws.as_str(), MARKER] {
         let p = space.join(f);
-        if p.exists() {
-            std::fs::remove_file(&p).ok();
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", p.display()));
+            }
         }
     }
     std::fs::remove_dir(space)
@@ -683,8 +1062,7 @@ fn copy_loose_files(canonical: &Path, dest: &Path) -> Result<()> {
     let ignored_md: Vec<String> = git(
         canonical,
         &["ls-files", "--others", "--ignored", "--exclude-standard"],
-    )
-    .unwrap_or_default()
+    )?
     .lines()
     .filter(|l| l.ends_with(".md"))
     .map(|s| s.to_string())
@@ -700,9 +1078,11 @@ fn copy_loose_files(canonical: &Path, dest: &Path) -> Result<()> {
         let from = canonical.join(rel);
         let to = dest.join(rel);
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::copy(&from, &to).ok();
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
     }
     Ok(())
 }
@@ -853,6 +1233,85 @@ mod tests {
 
         // Adding twice is refused, not silently duplicated.
         assert!(add_repo(&space, "api").is_err());
+    }
+
+    #[test]
+    fn adopt_preserves_an_existing_folder_and_recognizes_pool_links() {
+        let sb = Sandbox::new("adopt");
+        let repo = sb.make_repo("api");
+        let folder = sb.root.join("existing");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("notes.txt"), "keep me").unwrap();
+        std::fs::create_dir(folder.join("ordinary-dir")).unwrap();
+        symlink(&repo, &folder.join("api")).unwrap();
+
+        let adopted = adopt_space_at(&sb.root, &folder).unwrap();
+
+        assert_eq!(adopted, std::fs::canonicalize(&folder).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(folder.join(MARKER).is_file());
+        assert!(folder.join("CLAUDE.md").is_file());
+        assert!(folder.join("AGENTS.md").is_file());
+        assert!(folder.join("existing.code-workspace").is_file());
+        let space = read_space(&folder);
+        assert_eq!(
+            space
+                .repos
+                .iter()
+                .find(|repo| repo.name == "api")
+                .unwrap()
+                .state,
+            RepoState::Symlink
+        );
+        assert_eq!(
+            space
+                .repos
+                .iter()
+                .find(|repo| repo.name == "ordinary-dir")
+                .unwrap()
+                .state,
+            RepoState::Foreign
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_generated_file_collisions_without_modifying_the_folder() {
+        let sb = Sandbox::new("adopt-collision");
+        let folder = sb.root.join("existing");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("CLAUDE.md"), "mine").unwrap();
+
+        let error = adopt_space_at(&sb.root, &folder).unwrap_err().to_string();
+
+        assert!(error.contains("without overwriting"), "got: {error}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("CLAUDE.md")).unwrap(),
+            "mine"
+        );
+        assert!(!folder.join(MARKER).exists());
+        assert!(!folder.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn adopt_refuses_links_outside_the_pool_and_nested_folders() {
+        let sb = Sandbox::new("adopt-boundaries");
+        let external = sb.root.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let folder = sb.root.join("existing");
+        std::fs::create_dir(&folder).unwrap();
+        symlink(&external, &folder.join("external-link")).unwrap();
+
+        let error = adopt_space_at(&sb.root, &folder).unwrap_err().to_string();
+        assert!(error.contains("not linked to a repository"), "got: {error}");
+        assert!(!folder.join(MARKER).exists());
+
+        let nested = external.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let error = adopt_space_at(&sb.root, &nested).unwrap_err().to_string();
+        assert!(error.contains("not a direct child"), "got: {error}");
     }
 
     #[test]
@@ -1020,6 +1479,7 @@ mod tests {
 
         // Scratch notes are sanctioned: not a member, don't show in pull/repos.
         std::fs::write(space.join("NOTES-ROOT.md"), "cross-repo scratch").unwrap();
+        std::fs::write(space.join(".env"), "also user-owned").unwrap();
         assert_eq!(read_space(&space).repos.len(), 2);
 
         // But they block deletion, up front, leaving the space fully intact.
@@ -1033,6 +1493,11 @@ mod tests {
         );
 
         std::fs::remove_file(space.join("NOTES-ROOT.md")).unwrap();
+        let err = delete_space(&space).unwrap_err().to_string();
+        assert!(err.contains(".env"), "got: {err}");
+        assert!(space.join("r-feature-y").is_dir());
+
+        std::fs::remove_file(space.join(".env")).unwrap();
         delete_space(&space).unwrap();
         assert!(!space.exists());
         // Canonical checkout survives untouched.
@@ -1066,6 +1531,40 @@ mod tests {
             std::fs::read_to_string(sb.pool().join("r").join("SCRATCH-NEW.md")).unwrap(),
             "new note"
         );
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_mutate_a_changed_space() {
+        let sb = Sandbox::new("stale");
+        sb.make_repo("a");
+        sb.make_repo("b");
+        let space = sb.root.join("s");
+        std::fs::create_dir(&space).unwrap();
+        write_space_files(&space, "s").unwrap();
+        add_repo(&space, "a").unwrap();
+        let stale = read_space(&space).revision;
+
+        add_repo(&space, "b").unwrap();
+        let error = remove_repo_from_snapshot(&space, "a", &stale)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed in another client"), "got: {error}");
+        assert!(space.join("a").is_symlink());
+        assert!(space.join("b").is_symlink());
+    }
+
+    #[test]
+    fn layout_lock_rejects_a_second_writer() {
+        let sb = Sandbox::new("lock");
+        let space = sb.root.join("s");
+        std::fs::create_dir(&space).unwrap();
+        write_space_files(&space, "s").unwrap();
+
+        let _first = LayoutLock::for_space(&space).unwrap();
+        let error = LayoutLock::for_space(&space).unwrap_err().to_string();
+
+        assert!(error.contains("another space client"), "got: {error}");
     }
 
     #[test]

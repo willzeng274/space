@@ -1,9 +1,10 @@
 //! Discovery and defensive parsing of Claude Code and Codex transcripts.
 //!
-//! Every file is opened READ-ONLY. Schemas are internal and drift between
-//! versions, so we match on `type`/`role`, pull fields when present, and skip
-//! anything we can't make sense of rather than failing the whole file.
+//! Schemas are internal and drift between versions, so we match on
+//! `type`/`role`, pull fields when present, and skip anything we can't make
+//! sense of rather than failing the whole file.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -22,11 +23,14 @@ pub enum Load {
 }
 
 pub fn claude_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
+    crate::claude::projects_root()
 }
 
 pub fn codex_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
+        .map(|root| root.join("sessions"))
 }
 
 /// Walk both roots on a background thread, parse each transcript, and stream
@@ -43,11 +47,60 @@ pub fn spawn_loader(tx: Sender<Load>) {
             }
         }
         if let Some(root) = codex_root() {
-            for path in jsonl_files(&root) {
-                if let Some(s) = parse_codex_file(&path)
-                    && tx.send(Load::Session(Box::new(s))).is_err()
-                {
-                    return;
+            let paths = jsonl_files(&root);
+            match crate::codex::list_threads() {
+                Ok(catalog) => {
+                    let mut parsed: HashMap<String, Session> = paths
+                        .iter()
+                        .filter_map(|path| parse_codex_file(path))
+                        .map(|session| (session.id.clone(), session))
+                        .collect();
+                    for meta in catalog {
+                        let mut session = parsed.remove(&meta.id).unwrap_or_else(|| {
+                            finalize(
+                                Backend::Codex,
+                                meta.id.clone(),
+                                String::new(),
+                                None,
+                                meta.cwd.clone(),
+                                meta.updated_at,
+                                Vec::new(),
+                            )
+                        });
+                        let custom_name = meta.name.clone();
+                        let title_source = meta
+                            .name
+                            .as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .or_else(|| {
+                                (!meta.preview.trim().is_empty()).then_some(meta.preview.as_str())
+                            });
+                        let title = title_source
+                            .map(truncate_title)
+                            .filter(|title| !title.is_empty())
+                            .unwrap_or_else(|| session.title.clone());
+                        let activity = if meta.updated_at > 0 {
+                            meta.updated_at
+                        } else {
+                            session.last_activity
+                        };
+                        session.apply_catalog(title, custom_name, meta.cwd, activity);
+                        if tx.send(Load::Session(Box::new(session))).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // If the state catalog is absent or incompatible, the
+                    // transcript parser still filters obvious exec/subagent
+                    // sessions and gives a useful degraded catalog.
+                    for path in paths {
+                        if let Some(s) = parse_codex_file(&path)
+                            && tx.send(Load::Session(Box::new(s))).is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -122,6 +175,7 @@ fn finalize(
     backend: Backend,
     id: String,
     title: String,
+    custom_name: Option<String>,
     cwd: String,
     last_activity: i64,
     messages: Vec<Message>,
@@ -140,6 +194,7 @@ fn finalize(
         backend,
         id,
         title,
+        custom_name,
         cwd,
         space,
         last_activity,
@@ -178,6 +233,7 @@ fn parse_claude_file(path: &Path) -> Option<Session> {
 
     let mut cwd = String::new();
     let mut ai_title = String::new();
+    let mut custom_title: Option<String> = None;
     let mut messages: Vec<Message> = Vec::new();
     let mut first_prose: Option<String> = None;
     let mut last_ts: i64 = 0;
@@ -194,6 +250,11 @@ fn parse_claude_file(path: &Path) -> Option<Session> {
             && let Some(t) = v.get("aiTitle").and_then(Value::as_str)
         {
             ai_title = t.to_string();
+        }
+        if ty == "custom-title"
+            && let Some(t) = v.get("customTitle").and_then(Value::as_str)
+        {
+            custom_title = Some(t.to_string());
         }
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str)
             && let Some(e) = parse_iso_epoch(ts)
@@ -228,7 +289,9 @@ fn parse_claude_file(path: &Path) -> Option<Session> {
         last_ts = file_mtime_epoch(path);
     }
 
-    let title = if !ai_title.is_empty() {
+    let title = if let Some(t) = custom_title.as_deref() {
+        truncate_title(t)
+    } else if !ai_title.is_empty() {
         truncate_title(&ai_title)
     } else if let Some(p) = first_prose {
         truncate_title(&p)
@@ -236,7 +299,15 @@ fn parse_claude_file(path: &Path) -> Option<Session> {
         format!("(session {})", &id[..id.len().min(8)])
     };
 
-    Some(finalize(Backend::Claude, id, title, cwd, last_ts, messages))
+    Some(finalize(
+        Backend::Claude,
+        id,
+        title,
+        custom_title,
+        cwd,
+        last_ts,
+        messages,
+    ))
 }
 
 /// Fallback when a Claude file carries no `cwd`: the directory name is the cwd
@@ -254,6 +325,7 @@ fn parse_codex_file(path: &Path) -> Option<Session> {
     let mut id = String::new();
     let mut cwd = String::new();
     let mut name = String::new();
+    let mut source_is_interactive: Option<bool> = None;
     let mut messages: Vec<Message> = Vec::new();
     let mut first_prose: Option<String> = None;
     let mut last_ts: i64 = 0;
@@ -283,7 +355,13 @@ fn parse_codex_file(path: &Path) -> Option<Session> {
         {
             cwd = c.to_string();
         }
-        if name.is_empty()
+        if ty == "session_meta" && source_is_interactive.is_none() {
+            source_is_interactive = payload
+                .get("source")
+                .map(|source| matches!(source.as_str(), Some("cli" | "vscode")));
+        }
+        if ty == "session_meta"
+            && name.is_empty()
             && let Some(n) = payload
                 .get("name")
                 .or_else(|| payload.get("title"))
@@ -345,6 +423,10 @@ fn parse_codex_file(path: &Path) -> Option<Session> {
         last_ts = file_mtime_epoch(path);
     }
 
+    if source_is_interactive == Some(false) {
+        return None;
+    }
+
     let title = if !name.is_empty() {
         truncate_title(&name)
     } else if let Some(p) = first_prose {
@@ -353,7 +435,15 @@ fn parse_codex_file(path: &Path) -> Option<Session> {
         format!("(session {})", &id[..id.len().min(8)])
     };
 
-    Some(finalize(Backend::Codex, id, title, cwd, last_ts, messages))
+    Some(finalize(
+        Backend::Codex,
+        id,
+        title,
+        None,
+        cwd,
+        last_ts,
+        messages,
+    ))
 }
 
 /// Extract the inner text of `<tag>...</tag>` from a blob, if present.
@@ -417,6 +507,19 @@ not even json
     }
 
     #[test]
+    fn claude_custom_title_wins_and_is_marked_user_assigned() {
+        let body = r#"
+{"type":"user","message":{"role":"user","content":"original prompt"},"cwd":"/tmp/x"}
+{"type":"ai-title","aiTitle":"Generated title","sessionId":"abc"}
+{"type":"custom-title","customTitle":"My chosen name","sessionId":"abc"}
+"#;
+        let p = write_tmp("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl", body);
+        let s = parse_claude_file(&p).unwrap();
+        assert_eq!(s.title, "My chosen name");
+        assert_eq!(s.custom_name.as_deref(), Some("My chosen name"));
+    }
+
+    #[test]
     fn codex_parse_env_context_and_response_items() {
         let root = crate::space::ROOT_DIR;
         let body = format!(
@@ -450,6 +553,38 @@ not even json
         assert_eq!(s.cwd, format!("/Users/me/{root}/sp/repo"));
         assert_eq!(s.space, "sp");
         assert_eq!(s.title, "hello there");
+    }
+
+    #[test]
+    fn codex_tool_call_name_never_becomes_the_title() {
+        let body = r#"
+{"type":"session_meta","payload":{"id":"dead-beef","cwd":"/tmp/x","source":"cli"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"repair workspace discovery"}]}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"{}"}}
+"#;
+        let p = write_tmp("rollout-2026-05-03-dead-beef.jsonl", body);
+        let s = parse_codex_file(&p).unwrap();
+        assert_eq!(s.title, "repair workspace discovery");
+    }
+
+    #[test]
+    fn codex_exec_rollouts_are_not_conversations() {
+        let body = r#"
+{"type":"session_meta","payload":{"id":"dead-beef","cwd":"/tmp/x","source":"exec"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"automation prompt"}]}}
+"#;
+        let p = write_tmp("rollout-2026-05-04-dead-beef.jsonl", body);
+        assert!(parse_codex_file(&p).is_none());
+    }
+
+    #[test]
+    fn codex_structured_subagent_rollouts_are_not_conversations() {
+        let body = r#"
+{"type":"session_meta","payload":{"id":"dead-beef","cwd":"/tmp/x","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"delegated prompt"}]}}
+"#;
+        let p = write_tmp("rollout-2026-05-05-dead-beef.jsonl", body);
+        assert!(parse_codex_file(&p).is_none());
     }
 
     #[test]

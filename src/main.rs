@@ -45,6 +45,8 @@ struct Cli {
 /// All work from anywhere inside a space.
 #[derive(Subcommand)]
 enum Cmd {
+    /// Convert an existing folder under the space root into a managed space
+    Adopt { path: Option<PathBuf> },
     /// Add a <repo>-<branch> worktree (run before branching)
     Wt { repo: String, branch: String },
     /// Update repos from origin (ff-only on main, fetch-only on branches)
@@ -81,6 +83,7 @@ fn main() -> Result<()> {
     }
 
     match cli.cmd {
+        Some(Cmd::Adopt { path }) => cmd_adopt(path.as_deref()),
         Some(Cmd::Wt { repo, branch }) => cmd_wt(&repo, &branch),
         Some(Cmd::Pull { repo }) => cmd_pull(repo.as_deref()),
         Some(Cmd::Add { repo }) => cmd_add(&repo),
@@ -88,6 +91,19 @@ fn main() -> Result<()> {
         Some(Cmd::Stack { repo }) => cmd_stack(repo.as_deref()),
         None => run_tui(cli.handoff_file),
     }
+}
+
+fn cmd_adopt(path: Option<&Path>) -> Result<()> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("PWD")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map_or_else(std::env::current_dir, Ok)?,
+    };
+    let adopted = spaces::adopt_space(&path)?;
+    println!("adopted {} as a space", adopted.display());
+    Ok(())
 }
 
 /// The space enclosing the caller's working directory. Prefers the shell's
@@ -458,4 +474,34 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_resume_and_fork_argv() {
+        let resume = resume_argv(Backend::Claude, "abc", false);
+        assert_eq!(
+            resume,
+            [
+                "claude",
+                "--resume",
+                "abc",
+                "--dangerously-skip-permissions"
+            ]
+        );
+        let fork = resume_argv(Backend::Claude, "abc", true);
+        assert_eq!(
+            fork,
+            [
+                "claude",
+                "--resume",
+                "abc",
+                "--fork-session",
+                "--dangerously-skip-permissions"
+            ]
+        );
+    }
 }
