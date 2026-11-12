@@ -184,7 +184,11 @@ fn collect_pool(dir: &Path, prefix: &str, out: &mut Vec<PoolRepo>) {
         } else {
             format!("{prefix}/{base}")
         };
-        if path.join(".git").exists() {
+        // Canonical pool checkouts have a real `.git` directory. Linked
+        // worktrees have a `.git` *file* pointing back to their canonical
+        // checkout, so accepting any `.git` path would accidentally promote a
+        // misplaced worktree into the pool.
+        if path.join(".git").is_dir() {
             out.push(PoolRepo { name, path });
         } else if prefix.is_empty() {
             collect_pool(&path, &name, out);
@@ -663,7 +667,7 @@ fn workspace_json(space: &Space) -> String {
 /// (`acme/api`) or a bare basename (`api`) when unambiguous.
 pub fn resolve_pool_repo(space: &Path, name: &str) -> Result<String> {
     let pool = pool_for(space).ok_or_else(|| anyhow!("cannot locate the repo pool"))?;
-    if pool.join(name).join(".git").exists() {
+    if pool.join(name).join(".git").is_dir() {
         return Ok(name.to_string());
     }
     let mut all: Vec<PoolRepo> = Vec::new();
@@ -1127,6 +1131,22 @@ branch has been made.
   multi-root workspace (`code {name}.code-workspace`). It regenerates when membership
   changes, so do not edit it by hand.
 
+## Local context and PR handoff
+
+- Keep active cross-repo evidence in `.context/<task>/` (notes, probes, snapshots, and
+  checkpoints that should not be committed). Add a short README with provenance, date,
+  scope, and current status. Load only the task directory relevant to the current work.
+- When reusing or cleaning a space, move completed or superseded task context to
+  `archive/<task>/` instead of deleting it. Worktrees may be removed once their work is
+  safely committed or otherwise preserved. Do not scan archived tasks by default or reuse
+  them as current truth without revalidation.
+- For a PR, write `.context/<task>/PR_DESCRIPTION.md` only after the final `base...HEAD`
+  diff and verification results are known. Describe the problem, concrete behavior change,
+  important design or operational constraints, and exact tests or live checks. For stacked
+  PRs, include the bottom-to-top stack with links and mark the current PR. Apply that exact
+  file with `gh pr create/edit --body-file`, then reread the rendered PR; never resurrect an
+  archived description without checking it against the current diff.
+
 ## Commands (run from anywhere inside this space)
 
 ```sh
@@ -1467,6 +1487,40 @@ mod tests {
     }
 
     #[test]
+    fn pool_excludes_linked_worktrees() {
+        let sb = Sandbox::new("pool-worktree");
+        let canonical = sb.make_repo("us/api");
+        let misplaced = sb.pool().join("us/api-feature-x");
+        let out = Command::new("git")
+            .current_dir(&canonical)
+            .args([
+                "worktree",
+                "add",
+                misplaced.to_str().unwrap(),
+                "-b",
+                "feature/x",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let mut pool = Vec::new();
+        collect_pool(&sb.pool(), "", &mut pool);
+        let names: Vec<&str> = pool.iter().map(|repo| repo.name.as_str()).collect();
+        assert_eq!(names, ["us/api"]);
+
+        let space = sb.root.join("s");
+        std::fs::create_dir(&space).unwrap();
+        write_space_files(&space, "s").unwrap();
+        assert!(resolve_pool_repo(&space, "us/api-feature-x").is_err());
+        assert!(resolve_pool_repo(&space, "api-feature-x").is_err());
+    }
+
+    #[test]
     fn delete_space_spares_canonical_and_refuses_user_files() {
         let sb = Sandbox::new("del");
         sb.make_repo("r");
@@ -1591,13 +1645,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_documents_agent_commands() {
-        let md = policy_markdown("proj");
-        assert!(md.contains("space wt <repo> <branch>"));
-        assert!(md.contains("space pull"));
-        assert!(md.contains("space add <repo>"));
-        assert!(md.contains("space ls"));
-        assert!(md.contains(&pool_display()));
+    fn policy_matches_golden_file() {
+        let actual = policy_markdown("proj").replace(&pool_display(), "{{POOL}}");
+        let expected = include_str!("../tests/fixtures/policy.md");
+        assert_eq!(actual, expected);
     }
 
     #[test]
